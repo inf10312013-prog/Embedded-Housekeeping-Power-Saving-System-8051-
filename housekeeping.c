@@ -1,8 +1,6 @@
 #include <reg52.h>
+#include <intrins.h>
 
-/*====================
-  HARDWARE
-====================*/
 #define BUS P0
 
 sbit ADDR0 = P1^0;
@@ -16,225 +14,637 @@ sbit LCD_RS = P1^0;
 sbit LCD_RW = P1^1;
 
 sbit KEY4 = P2^7;
+sbit IO_18B20 = P3^2;
 
-/*====================
-  TYPE
-====================*/
-typedef unsigned char u8;
-typedef unsigned int  u16;
-typedef unsigned long u32;
+typedef unsigned char  u8;
+typedef unsigned int   u16;
+typedef unsigned long  u32;
 
-/*====================
-  GLOBAL
-====================*/
-u32 tick = 0;
-u8 counter = 0;
-u32 last_activity = 0;
+typedef enum
+{
+    STATE_ACTIVE = 0,
+    STATE_POWERSAVE,
+    STATE_FAULT
+} SystemState_t;
 
-bit seg_enable = 1;
+/*========================
+  Global variables
+========================*/
+volatile u32 g_ms_tick = 0;
+volatile bit g_seg_enable = 1;
 
-/*====================
-  STATE
-====================*/
-typedef enum {
-    ACTIVE,
-    POWERSAVE,
-    FAULT
-} STATE;
+SystemState_t g_state = STATE_ACTIVE;
 
-STATE state = ACTIVE;
+u8  g_counter = 0;
+u32 g_last_activity_ms = 0;
 
-/*====================
-  7SEG
-====================*/
-u8 code seg_table[10] = {
-0xC0,0xF9,0xA4,0xB0,0x99,
-0x92,0x82,0xF8,0x80,0x90
+int g_temp_raw = 0;
+int g_temp_c = 0;
+
+#define TEMP_FAULT_TH  27
+
+u8 code LedChar[10] = {
+    0xC0, 0xF9, 0xA4, 0xB0, 0x99,
+    0x92, 0x82, 0xF8, 0x80, 0x90
 };
 
-u8 seg_buf[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+u8 LedBuff[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-void SegShow(u8 n){ seg_buf[0] = seg_table[n]; }
-void SegOff(){ seg_buf[0] = 0xFF; }
-
-/*====================
-  SEG REFRESH
-====================*/
-void SegRefresh()
+/*========================
+  Delay
+========================*/
+void delay_ms(u16 ms)
 {
-    static u8 i=0;
-
-    if(!seg_enable){ ENLED=1; return; }
-
-    ENLED=0; ADDR3=1;
-
-    if(i==0){ADDR2=0;ADDR1=0;ADDR0=0;i++;BUS=seg_buf[0];}
-    else if(i==1){ADDR2=0;ADDR1=0;ADDR0=1;i++;BUS=seg_buf[1];}
-    else if(i==2){ADDR2=0;ADDR1=1;ADDR0=0;i++;BUS=seg_buf[2];}
-    else if(i==3){ADDR2=0;ADDR1=1;ADDR0=1;i++;BUS=seg_buf[3];}
-    else if(i==4){ADDR2=1;ADDR1=0;ADDR0=0;i++;BUS=seg_buf[4];}
-    else {ADDR2=1;ADDR1=0;ADDR0=1;i=0;BUS=seg_buf[5];}
+    u16 i, j;
+    for(i = 0; i < ms; i++)
+        for(j = 0; j < 120; j++);
 }
 
-/*====================
-  TIMER
-====================*/
-void Timer0_ISR() interrupt 1
+/*========================
+  7-seg control
+========================*/
+void Seg_ShowOneDigit(u8 num)
 {
-    TH0=0xFC; TL0=0x67;
-    tick++;
-    SegRefresh();
+    LedBuff[0] = LedChar[num];
+    LedBuff[1] = 0xFF;
+    LedBuff[2] = 0xFF;
+    LedBuff[3] = 0xFF;
+    LedBuff[4] = 0xFF;
+    LedBuff[5] = 0xFF;
 }
 
-void TimerInit()
+void Seg_BlankAll(void)
 {
-    TMOD=0x01;
-    TH0=0xFC; TL0=0x67;
-    ET0=1; EA=1; TR0=1;
+    LedBuff[0] = 0xFF;
+    LedBuff[1] = 0xFF;
+    LedBuff[2] = 0xFF;
+    LedBuff[3] = 0xFF;
+    LedBuff[4] = 0xFF;
+    LedBuff[5] = 0xFF;
 }
 
-/*====================
-  KEY
-====================*/
-bit KeyPressed()
+void LedRefresh(void)
 {
-    P2=0xF7;
-    return (KEY4==0);
-}
+    static u8 i = 0;
 
-/*====================
-  I2C (簡化bit-bang)
-====================*/
-sbit SDA = P2^1;
-sbit SCL = P2^0;
-
-void I2CStart(){ SDA=1;SCL=1;SDA=0;SCL=0; }
-void I2CStop(){ SDA=0;SCL=1;SDA=1; }
-
-bit I2CWrite(u8 dat)
-{
-    u8 i;
-    for(i=0;i<8;i++){
-        SDA = (dat&0x80);
-        SCL=1;SCL=0;
-        dat<<=1;
+    if(!g_seg_enable)
+    {
+        ENLED = 1;
+        return;
     }
-    SDA=1; SCL=1;
-    i = SDA;
-    SCL=0;
-    return !i;
+
+    ENLED = 0;
+    ADDR3 = 1;
+
+    if(i == 0)
+    {
+        ADDR2 = 0; ADDR1 = 0; ADDR0 = 0;
+        BUS = LedBuff[0];
+        i = 1;
+    }
+    else if(i == 1)
+    {
+        ADDR2 = 0; ADDR1 = 0; ADDR0 = 1;
+        BUS = LedBuff[1];
+        i = 2;
+    }
+    else if(i == 2)
+    {
+        ADDR2 = 0; ADDR1 = 1; ADDR0 = 0;
+        BUS = LedBuff[2];
+        i = 3;
+    }
+    else if(i == 3)
+    {
+        ADDR2 = 0; ADDR1 = 1; ADDR0 = 1;
+        BUS = LedBuff[3];
+        i = 4;
+    }
+    else if(i == 4)
+    {
+        ADDR2 = 1; ADDR1 = 0; ADDR0 = 0;
+        BUS = LedBuff[4];
+        i = 5;
+    }
+    else
+    {
+        ADDR2 = 1; ADDR1 = 0; ADDR0 = 1;
+        BUS = LedBuff[5];
+        i = 0;
+    }
 }
 
-u8 I2CRead()
+/*========================
+  LCD bus arbitration
+========================*/
+void LcdBusTake(void)
 {
-    u8 i,dat=0;
-    SDA=1;
-    for(i=0;i<8;i++){
-        SCL=1;
-        dat=(dat<<1)|SDA;
-        SCL=0;
+    g_seg_enable = 0;
+    ENLED = 1;
+}
+
+void LcdBusRelease(void)
+{
+    g_seg_enable = 1;
+}
+
+/*========================
+  LCD1602
+========================*/
+void LcdWaitReady(void)
+{
+    u8 sta;
+
+    LcdBusTake();
+
+    BUS = 0xFF;
+    LCD_RS = 0;
+    LCD_RW = 1;
+    do {
+        LCD_E = 1;
+        sta = BUS;
+        LCD_E = 0;
+    } while (sta & 0x80);
+
+    LcdBusRelease();
+}
+
+void LcdWriteCmd(u8 cmd)
+{
+    LcdWaitReady();
+
+    LcdBusTake();
+
+    LCD_RS = 0;
+    LCD_RW = 0;
+    BUS = cmd;
+    LCD_E = 1;
+    LCD_E = 0;
+
+    LcdBusRelease();
+}
+
+void LcdWriteDat(u8 dat)
+{
+    LcdWaitReady();
+
+    LcdBusTake();
+
+    LCD_RS = 1;
+    LCD_RW = 0;
+    BUS = dat;
+    LCD_E = 1;
+    LCD_E = 0;
+
+    LcdBusRelease();
+}
+
+void LcdSetCursor(u8 x, u8 y)
+{
+    u8 addr;
+
+    if(y == 0)
+        addr = 0x00 + x;
+    else
+        addr = 0x40 + x;
+
+    LcdWriteCmd(addr | 0x80);
+}
+
+void LcdShowStr(u8 x, u8 y, char *str)
+{
+    LcdSetCursor(x, y);
+    while(*str != '\0')
+    {
+        LcdWriteDat(*str++);
     }
+}
+
+void InitLcd1602(void)
+{
+    delay_ms(20);
+    LcdWriteCmd(0x38);
+    LcdWriteCmd(0x0C);
+    LcdWriteCmd(0x06);
+    LcdWriteCmd(0x01);
+    delay_ms(5);
+}
+
+/*========================
+  Temperature display helper
+========================*/
+void ShowTempLine(int temp_c)
+{
+    char buf[16];
+
+    buf[0] = 'T';
+    buf[1] = ':';
+
+    if(temp_c >= 100)
+    {
+        buf[2] = '0' + (temp_c / 100);
+        buf[3] = '0' + ((temp_c / 10) % 10);
+        buf[4] = '0' + (temp_c % 10);
+        buf[5] = 'C';
+        buf[6] = ' ';
+        buf[7] = ' ';
+        buf[8] = ' ';
+        buf[9] = '\0';
+    }
+    else if(temp_c >= 10)
+    {
+        buf[2] = '0' + (temp_c / 10);
+        buf[3] = '0' + (temp_c % 10);
+        buf[4] = 'C';
+        buf[5] = ' ';
+        buf[6] = ' ';
+        buf[7] = ' ';
+        buf[8] = ' ';
+        buf[9] = '\0';
+    }
+    else if(temp_c >= 0)
+    {
+        buf[2] = '0' + temp_c;
+        buf[3] = 'C';
+        buf[4] = ' ';
+        buf[5] = ' ';
+        buf[6] = ' ';
+        buf[7] = ' ';
+        buf[8] = ' ';
+        buf[9] = '\0';
+    }
+    else
+    {
+        /* simple negative display */
+        buf[2] = '-';
+        buf[3] = '0' + (-temp_c);
+        buf[4] = 'C';
+        buf[5] = ' ';
+        buf[6] = ' ';
+        buf[7] = ' ';
+        buf[8] = ' ';
+        buf[9] = '\0';
+    }
+
+    LcdShowStr(0, 1, buf);
+}
+
+/*========================
+  UI
+========================*/
+void UI_ShowActive(void)
+{
+    LcdWriteCmd(0x01);
+    delay_ms(5);
+    LcdShowStr(0, 0, "ACTIVE        ");
+    ShowTempLine(g_temp_c);
+    LcdSetCursor(12, 0);
+    LcdWriteDat('0' + g_counter);
+}
+
+void UI_UpdateCounterOnly(void)
+{
+    LcdSetCursor(12, 0);
+    LcdWriteDat('0' + g_counter);
+}
+
+void UI_UpdateTempOnly(void)
+{
+    ShowTempLine(g_temp_c);
+}
+
+void UI_ShowPowerSave(void)
+{
+    LcdWriteCmd(0x01);
+    delay_ms(5);
+    LcdShowStr(0, 0, "TIMEOUT > 5S  ");
+    LcdShowStr(0, 1, "PWR SAVE      ");
+}
+
+void UI_ShowFault(void)
+{
+    LcdWriteCmd(0x01);
+    delay_ms(5);
+    LcdShowStr(0, 0, "TEMP FAULT    ");
+    ShowTempLine(g_temp_c);
+}
+
+/*========================
+  State transitions
+========================*/
+void EnterActive(void)
+{
+    g_state = STATE_ACTIVE;
+    g_last_activity_ms = g_ms_tick;
+    Seg_ShowOneDigit(g_counter);
+    UI_ShowActive();
+}
+
+void EnterPowerSave(void)
+{
+    g_state = STATE_POWERSAVE;
+    Seg_BlankAll();
+    UI_ShowPowerSave();
+}
+
+void EnterFault(void)
+{
+    g_state = STATE_FAULT;
+    Seg_BlankAll();
+    UI_ShowFault();
+}
+
+/*========================
+  Timer0
+========================*/
+void Timer0_Init(void)
+{
+    TMOD &= 0xF0;
+    TMOD |= 0x01;
+
+    TH0 = 0xFC;
+    TL0 = 0x67;
+
+    ET0 = 1;
+    EA  = 1;
+    TR0 = 1;
+}
+
+void Timer0_ISR(void) interrupt 1
+{
+    TH0 = 0xFC;
+    TL0 = 0x67;
+    g_ms_tick++;
+    LedRefresh();
+}
+
+/*========================
+  KEY4
+========================*/
+bit Key4_IsPressedRaw(void)
+{
+    P2 = 0xF7;
+    return (KEY4 == 0) ? 1 : 0;
+}
+
+bit Key4_GetPressEvent(void)
+{
+    static bit stable_state = 1;
+    static bit last_raw = 1;
+    static u8 debounce_cnt = 0;
+    bit raw_now;
+
+    raw_now = Key4_IsPressedRaw() ? 0 : 1;
+
+    if(raw_now == last_raw)
+    {
+        if(debounce_cnt < 3)
+            debounce_cnt++;
+    }
+    else
+    {
+        debounce_cnt = 0;
+        last_raw = raw_now;
+    }
+
+    if(debounce_cnt >= 3)
+    {
+        if(stable_state != raw_now)
+        {
+            stable_state = raw_now;
+            if(stable_state == 0)
+                return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*========================
+  DS18B20
+========================*/
+void DelayX10us(u8 t)
+{
+    do {
+        _nop_(); _nop_(); _nop_(); _nop_();
+        _nop_(); _nop_(); _nop_(); _nop_();
+    } while (--t);
+}
+
+bit Get18B20Ack(void)
+{
+    bit ack;
+
+    EA = 0;
+    IO_18B20 = 0;
+    DelayX10us(50);
+    IO_18B20 = 1;
+    DelayX10us(6);
+    ack = IO_18B20;
+    while(!IO_18B20);
+    EA = 1;
+
+    return ack;
+}
+
+void Write18B20(u8 dat)
+{
+    u8 mask;
+
+    EA = 0;
+    for(mask = 0x01; mask != 0; mask <<= 1)
+    {
+        IO_18B20 = 0;
+        _nop_();
+        _nop_();
+        if((mask & dat) == 0)
+            IO_18B20 = 0;
+        else
+            IO_18B20 = 1;
+        DelayX10us(6);
+        IO_18B20 = 1;
+    }
+    EA = 1;
+}
+
+u8 Read18B20(void)
+{
+    u8 dat = 0;
+    u8 mask;
+
+    EA = 0;
+    for(mask = 0x01; mask != 0; mask <<= 1)
+    {
+        IO_18B20 = 0;
+        _nop_();
+        _nop_();
+        IO_18B20 = 1;
+        _nop_();
+        _nop_();
+
+        if(!IO_18B20)
+            dat &= ~mask;
+        else
+            dat |= mask;
+
+        DelayX10us(6);
+    }
+    EA = 1;
+
     return dat;
 }
 
-u8 GetADC(u8 ch)
+bit Start18B20(void)
 {
-    u8 val;
+    bit ack;
 
-    I2CStart();
-    I2CWrite(0x90);
-    I2CWrite(0x40|ch);
-    I2CStart();
-    I2CWrite(0x91);
-    I2CRead();
-    val = I2CRead();
-    I2CStop();
-
-    return val;
+    ack = Get18B20Ack();
+    if(ack == 0)
+    {
+        Write18B20(0xCC);
+        Write18B20(0x44);
+    }
+    return ~ack;
 }
 
-/*====================
-  LCD（最簡版）
-====================*/
-void LcdCmd(u8 c)
+bit Get18B20Temp(int *temp)
 {
-    seg_enable=0; ENLED=1;
-    LCD_RS=0; LCD_RW=0;
-    BUS=c; LCD_E=1; LCD_E=0;
-    seg_enable=1;
+    bit ack;
+    u8 LSB, MSB;
+
+    ack = Get18B20Ack();
+    if(ack == 0)
+    {
+        Write18B20(0xCC);
+        Write18B20(0xBE);
+        LSB = Read18B20();
+        MSB = Read18B20();
+        *temp = ((int)MSB << 8) + LSB;
+    }
+    return ~ack;
 }
 
-void LcdDat(u8 d)
+/*========================
+  Main task
+========================*/
+void Housekeeping_Task(void)
 {
-    seg_enable=0; ENLED=1;
-    LCD_RS=1; LCD_RW=0;
-    BUS=d; LCD_E=1; LCD_E=0;
-    seg_enable=1;
+    static u32 last_key_scan_ms   = 0;
+    static u32 last_temp_start_ms = 0;
+    static u32 last_temp_read_ms  = 0;
+    static u32 last_ui_temp_ms    = 0;
+    bit key_event = 0;
+
+    /* every 10ms scan key */
+    if((g_ms_tick - last_key_scan_ms) >= 10)
+    {
+        last_key_scan_ms = g_ms_tick;
+        key_event = Key4_GetPressEvent();
+    }
+
+    /* every 1000ms start a new DS18B20 conversion */
+    if((g_ms_tick - last_temp_start_ms) >= 1000)
+    {
+        last_temp_start_ms = g_ms_tick;
+        Start18B20();
+    }
+
+    /* read temperature after conversion time */
+    if((g_ms_tick - last_temp_read_ms) >= 1200)
+    {
+        last_temp_read_ms = g_ms_tick;
+        if(Get18B20Temp(&g_temp_raw))
+        {
+            g_temp_c = g_temp_raw / 16;
+        }
+    }
+
+    switch(g_state)
+    {
+        case STATE_ACTIVE:
+
+            if(g_temp_c >= TEMP_FAULT_TH)
+            {
+                EnterFault();
+                break;
+            }
+
+            if(key_event)
+            {
+                g_counter++;
+                if(g_counter >= 10)
+                    g_counter = 0;
+
+                g_last_activity_ms = g_ms_tick;
+                Seg_ShowOneDigit(g_counter);
+                UI_UpdateCounterOnly();
+            }
+
+            if((g_ms_tick - last_ui_temp_ms) >= 500)
+            {
+                last_ui_temp_ms = g_ms_tick;
+                UI_UpdateTempOnly();
+            }
+
+            if((g_ms_tick - g_last_activity_ms) >= 5000)
+            {
+                EnterPowerSave();
+            }
+            break;
+
+        case STATE_POWERSAVE:
+
+            if(g_temp_c >= TEMP_FAULT_TH)
+            {
+                EnterFault();
+                break;
+            }
+
+            if(key_event)
+            {
+                g_counter++;
+                if(g_counter >= 10)
+                    g_counter = 0;
+
+                EnterActive();
+            }
+            break;
+
+        case STATE_FAULT:
+
+            /* only KEY4 can clear fault */
+            if(key_event)
+            {
+                g_last_activity_ms = g_ms_tick;
+                EnterActive();
+            }
+            break;
+
+        default:
+            EnterActive();
+            break;
+    }
 }
 
-void LcdStr(u8 x,u8 y,char *s)
+/*========================
+  main
+========================*/
+void main(void)
 {
-    LcdCmd(0x80 + (y?0x40:0)+x);
-    while(*s) LcdDat(*s++);
-}
+    ENLED = 1;
+    Seg_BlankAll();
 
-void LcdInit()
-{
-    LcdCmd(0x38);
-    LcdCmd(0x0C);
-    LcdCmd(0x06);
-    LcdCmd(0x01);
-}
+    InitLcd1602();
+    Timer0_Init();
 
-/*====================
-  MAIN
-====================*/
-void main()
-{
-    u8 adc;
+    g_counter = 0;
+    g_temp_c = 0;
 
-    TimerInit();
-    LcdInit();
-
-    SegShow(0);
-    last_activity = tick;
+    Start18B20();   /* first conversion */
+    EnterActive();
 
     while(1)
     {
-        /* KEY */
-        if(KeyPressed())
-        {
-            counter=(counter+1)%10;
-            SegShow(counter);
-            last_activity = tick;
-
-            if(state!=ACTIVE)
-                state=ACTIVE;
-        }
-
-        /* TEMP (ADC) */
-        adc = GetADC(0);
-
-        if(adc > 180)   // 溫度過高
-            state = FAULT;
-
-        /* STATE */
-        if(state==ACTIVE)
-        {
-            if(tick-last_activity>5000)
-                state=POWERSAVE;
-
-            LcdStr(0,0,"ACTIVE       ");
-        }
-        else if(state==POWERSAVE)
-        {
-            SegOff();
-            LcdStr(0,0,"PWR SAVE     ");
-        }
-        else if(state==FAULT)
-        {
-            SegOff();
-            LcdStr(0,0,"TEMP FAULT   ");
-        }
+        Housekeeping_Task();
     }
 }
